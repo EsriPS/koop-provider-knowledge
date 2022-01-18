@@ -45,27 +45,64 @@ function getTransformedCoordinateArray (value, transformObj) {
   return coordArray
 }
 
-function getGraphCount (rows) {
+function convertGraphToRelationshipGeoJSON (rows, geometryField, transformObj) {
+  const features = []
+  let currentRel = {
+    type: 'FeatureCollection',
+    features: [],
+    properties: {
+    }
+  }
 
+  rows.forEach((row, idx) => {
+    const rowJSON = row
+    const featureRow = rowJSON.values[0].toJSON()
+    const rowOId = Number(featureRow.entityValue.properties.objectid.primitiveValue.sint64Value)
+
+    if (currentRel.properties.objectid !== rowOId) {
+
+      if (currentRel.properties.objectid >= -1) {
+        features.push(currentRel)
+      }
+
+      currentRel = {
+        type: 'FeatureCollection',
+        features: [],
+        properties: {
+          objectid: Number(rowOId)
+        }
+      }
+    }
+
+    currentRel.features.push(formatFeature(rowJSON.values[1].entityValue, geometryField, transformObj))
+  })
+
+  if (currentRel.properties.objectid >= -1) {
+    features.push(currentRel)
+  }
+
+  return {
+    type: 'FeatureCollection',
+    features: features
+  }
 }
 
-function convertGraphToGeoJSON (rows, transformObj) {
+function convertGraphToGeoJSON (rows, geometryField, transformObj) {
   return {
     type: 'FeatureCollection',
     features: rows.map((inputFeature) => {
-      return formatFeature(inputFeature, transformObj)
+      return formatFeature(inputFeature.values[0].entityValue, geometryField, transformObj)
     })
   }
 }
 
-function formatFeature (inputFeature, transformObj) {
-  const entity = inputFeature.values[0].entityValue
-  const shape = (entity.properties.shape?.toJSON())?.primitiveValue.geometryValue
-
+function formatFeature (entity, geometryField, transformObj) {
+  const shape = geometryField ? (entity.properties[geometryField]?.toJSON())?.primitiveValue.geometryValue : null
+  
   const featureProps = {}
   for (let key in entity.properties) {
     // need to handle more cases
-    if (key !== 'shape') {
+    if (key !== geometryField) {
       const entityValue = entity.properties[key].toJSON()
       const firstKey = Object.keys(entityValue.primitiveValue)[0]
       let val = entityValue.primitiveValue[firstKey]
@@ -160,18 +197,71 @@ function sqlToOpenCypherWhere (sqlStmt) {
 function convertDataModelToFCs (dataModel) {
   const layers = []
   const tables = []
+  const relationships = []
+  const layerTableMap = {}
   for (const entityIdx in dataModel.entityTypes) {
     const entity = dataModel.entityTypes[entityIdx].entity.toJSON()
 
     const layer = entityJSONtoFCMetadata(entity)
+    layerTableMap[entity.name] = layer
     if (layer.metadata.geometryType) {
-      layers.push(entity)
+      layers.push(layer)
     } else {
       // table ids currently
-      tables.push(entity)
+      tables.push(layer)
     }
   }
-  return { layers: layers, tables: tables }
+
+  layers.forEach((layer, idx) => {
+    layer.metadata.id = idx
+  })
+
+  tables.forEach((table, idx) => {
+    table.metadata.id = layers.length + idx
+  })
+  
+  dataModel.relationshipTypes.forEach(relationship => {
+    relationship.originEntityTypes.forEach( (originEntityType) => {
+      relationship.destEntityTypes.forEach( (destEntityType) => {
+
+        relJSON = buildRelationshipsJSON(
+          relationships.length,
+          relationship.relationship.name,
+          layerTableMap[originEntityType].metadata.id,
+          layerTableMap[destEntityType].metadata.id)
+
+        layerTableMap[originEntityType].metadata.relationships.push(relJSON[0])
+        relationships.push(relJSON[0])
+
+        if (originEntityType !== destEntityType) {
+          layerTableMap[destEntityType].metadata.relationships.push(relJSON[1])
+          //relationships.push(relJSON[1])
+        }
+
+        
+      })
+    })
+  })
+  return { layers, tables, relationships }
+}
+
+function buildRelationshipsJSON (id, name, originId, destId) {
+  return [
+    buildRelationshipJSON(id, name, destId, "esriRelCardinalityOneToMany", "esriRelRoleOrigin", "originGlobalID", false),
+    buildRelationshipJSON(id, name, originId, "esriRelCardinalityOneToMany", "esriRelRoleDestination", "destinationGlobalID", false)
+  ]
+}
+
+function buildRelationshipJSON (id, name, relatedTableId, cardinality, role, keyField, composite) {
+  return {
+    id,
+    name,
+    relatedTableId,
+    cardinality,
+    role,
+    keyField,
+    composite
+  }
 }
 
 function entityJSONtoFCMetadata (entity) {
@@ -185,6 +275,8 @@ function entityJSONtoFCMetadata (entity) {
   metadata.description = entity.name
   metadata.extent = [[180, 90], [-180, -90]]
   metadata.fields = []
+  metadata.relationships = []
+
   let geomType = null
   for (const propIdx in entity.properties) {
     const prop = entity.properties[propIdx]
@@ -240,8 +332,9 @@ class KnowledgeGraphServer {
               const layersAndTables = convertDataModelToFCs(data)
               this.layers = layersAndTables.layers
               this.tables = layersAndTables.tables
+              this.relationships = layersAndTables.relationships
 
-              resolve(data)
+              resolve({dataModel:data, FCs:layersAndTables})
             } else {
               log.error('Error in retrieval of Data Model from AKG endpoint', data)
               this.dataModel = null
@@ -255,7 +348,7 @@ class KnowledgeGraphServer {
     return callback
   }
 
-  getEntityById (layerIdStr, query) {
+  getEntityById (layerIdStr, query = {}) {
     const callback = new Promise((resolve, reject) => {
       this.getDataModel(query).then((dataModel) => {
         let layerId = -1
@@ -284,9 +377,9 @@ class KnowledgeGraphServer {
     return callback
   }
 
-  queryEntity (entity, query) {
+  queryEntity (entity, query = {}) {
     let namespace = 'n'
-    let openCypherQuery = 'match (' + namespace + ':' + entity + ') '
+    let openCypherQuery = 'match (' + namespace + ':' + entity.metadata.name + ') '
     if (query && ((query.where && query.where !== '1=1') || query.objectIds)) {
       // https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer-.htm
       // todo add support for:
@@ -332,10 +425,10 @@ class KnowledgeGraphServer {
 
     log.debug('openCypyerQuery', openCypherQuery)
 
-    return this.query(openCypherQuery, query)
+    return this.query(entity, openCypherQuery, query)
   }
 
-  query (openCypherQuery, query) {
+  query (entity, openCypherQuery, query, isRelationship=false) {
     const callback = new Promise((resolve, reject) => {
       let callURL = this.url + '/graph/query/?openCypherQuery=' + encodeURIComponent(openCypherQuery)
       if (query.geometry) {
@@ -358,7 +451,10 @@ class KnowledgeGraphServer {
                 count: getGraphCount(data.results.rows)
               }
             } else {
-              geojson = convertGraphToGeoJSON(data.results.rows, data.header.transform)
+              const field = entity.metadata.fields.find(field => field.type === 'Geometry')
+              if (isRelationship) geojson = convertGraphToRelationshipGeoJSON(data.results.rows, field?.name, data.header.transform)
+              else geojson = convertGraphToGeoJSON(data.results.rows, field?.name, data.header.transform)
+
             }
             geojson.metadata = { idField: 'OBJECTID' }
 
@@ -380,6 +476,82 @@ class KnowledgeGraphServer {
       }).catch(error => {
         log.error('ERROR: ', error)
         reject(error)
+      })
+    })
+
+    return callback
+  }
+
+  queryRelatedRecords (entity, query) {
+    const {relationshipId} = query
+
+    const entityRel = entity.metadata.relationships.find(rel => rel.id === relationshipId)
+
+    const callback = new Promise((resolve, reject) => {
+      this.getEntityById(entityRel.relatedTableId, query).then(newEntity => {
+
+        let namespace = 'n'
+        let otherNamespace = 'm'
+        let originDirection = '>'
+        let destDirection = ''
+        if (entityRel.role === 'esriRelRoleDestination') {
+          originDirection = ''
+          destDirection = '<'
+        }
+        //todo figure out direction arrow
+        let openCypherQuery = `match (${namespace}:${entity.metadata.name})${destDirection}-[r:${entityRel.name}]-${originDirection}(${otherNamespace}:${newEntity.metadata.name})`
+
+        if (query && ((query.where && query.where !== '1=1') || query.objectIds)) {
+          // https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer-.htm
+          // todo add support for:
+          // * geometry/geometryType?
+          // * time?
+          // * distance - buffer?
+          // * outFields
+          // * returnGeometry
+          // * havingClause?
+          // * returnDistinctValues?
+          // * returnCountOnly
+          let where = query.where
+
+          if (query.objectIds) {
+            where = `objectid in (${query.objectIds})`
+          }
+
+          // will this always be the case that the entityType has objectid lowercase and koop wants it upper?
+          where = where.replace(/OBJECTID/ig, 'objectid')
+
+          const parser = new Parser()
+          const ast = parser.astify('SELECT * FROM BLAH as n WHERE ' + where)
+          addNamespaceToAST(namespace, ast)
+          where = sqlToOpenCypherWhere(parser.sqlify(ast))
+          openCypherQuery += `where ${where} `
+        }
+
+        // const outFields = query.outFields
+        if (query.returnIdsOnly && query.returnIdsOnly === 'true') {
+          namespace = namespace + '.objectid'
+        }
+        // TODO figure out best way to filter fields, may require enhancing the parsing of responses
+        // else if (outFields && outFields.trim().length > 0) {
+        //     namespace = 'n.' + outFields.split(/\s*,\s*/).join(`, ${namespace}.`)
+        // }
+
+        // todo add query.returnCountOnly validation
+        openCypherQuery += `return ${namespace},${otherNamespace} order by ${namespace}.objectid`// "return " + (query.returnCountOnly ? "count(" + namespace + ")" : namespace);
+
+        if (query.resultRecordCount) {
+          openCypherQuery += ' limit ' + query.resultRecordCount
+        }
+
+        log.debug('openCypyerQuery', openCypherQuery)
+    
+        this.query(newEntity, openCypherQuery, query, true).then(data => {
+          if (!data.metadata) data.metadata = {}
+          data.metadata.fields = newEntity.metadata.fields;
+          resolve(data);
+
+        }).catch(error => reject(error))
       })
     })
 
