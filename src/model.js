@@ -120,7 +120,7 @@ function handleServerInfoRequest (query, graph, callback) {
     callback(null, data.FCs)
   }).catch(error => {
     log.error('error in server info', error)
-    callback(getError(error.message))
+    callback(error)
   })
 }
 

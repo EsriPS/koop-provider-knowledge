@@ -104,16 +104,18 @@ function formatFeature (entity, geometryField, transformObj) {
     // need to handle more cases
     if (key !== geometryField) {
       const entityValue = entity.properties[key].toJSON()
-      const firstKey = Object.keys(entityValue.primitiveValue)[0]
-      let val = entityValue.primitiveValue[firstKey]
-      // todo handle dates
-      if (firstKey.includes('int') || firstKey.includes('float')) {
-        val = Number(val)
+      if (entityValue.primitiveValue) {
+        const firstKey = Object.keys(entityValue.primitiveValue)[0]
+        let val = entityValue.primitiveValue[firstKey]
+        // todo handle dates
+        if (firstKey.includes('int') || firstKey.includes('float')) {
+          val = Number(val)
+        }
+        if (key === 'objectid') {
+          key = key.toUpperCase()
+        }
+        featureProps[key] = val
       }
-      if (key === 'objectid') {
-        key = key.toUpperCase()
-      }
-      featureProps[key] = val
     }
   }
 
