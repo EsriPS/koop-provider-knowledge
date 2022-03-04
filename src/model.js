@@ -2,7 +2,6 @@ const KnowledgeGraphServer = require('./KnowledgeGraphServer')
 const config = require('config')
 const Logger = require('@koopjs/logger')
 const log = new Logger(config)
-const should = require('should')
 
 function Model (koop) {
   koop.server.get('/rest/info', function (req, res) {
