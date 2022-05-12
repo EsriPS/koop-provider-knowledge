@@ -30,52 +30,40 @@ Model.prototype.getData = function (req, callback) {
   const query = req.query
 
   if (id && this.kgServers[id]) {
-
     const graph = this.kgServers[id]
 
     // If a layer exists, perform a layer info or operation request
     if (layer) {
-
       // If no method then request if for layer info, return layer info for invalid operations
       // like the ArcGIS Server REST API does
       if (method == null) {
         handleLayerInfoRequest(layer, query, graph, callback)
-
       } else if (method === 'query') {
         handleLayerQuery(layer, query, graph, callback)
-
       } else if (method === 'queryRelatedRecords') {
         handleRelatedRecords(layer, query, graph, callback)
-
       }
-
     } else {
       handleServerInfoRequest(query, graph, callback)
-
     }
-
   } else {
     callback(getError(`Service ${id} not found `, 404))
-
   }
 }
 
-function getError(message, code=500, stack=[]) {
-  return { code, message, stack}
+function getError (message, code = 500, stack = []) {
+  return { code, message, stack }
 }
 
 function handleLayerQuery (layer, query, graph, callback) {
   graph.getEntityById(layer, query).then(entity => {
     const name = entity.metadata.name
     graph.queryEntity(entity, query).then(geojson => {
-
       callback(null, geojson)
-
     }).catch(error => {
       log.error('Query entity', name, error)
       callback(getError(error.message))
     })
-
   }).catch(error => {
     log.error('Query get entity by layer id', error)
     // ArcGIS Server REST API has code 500, message null for invalid layer
@@ -87,14 +75,11 @@ function handleRelatedRecords (layer, query, graph, callback) {
   graph.getEntityById(layer, query).then(entity => {
     const name = entity.metadata.name
     graph.queryRelatedRecords(entity, query).then(geojson => {
-
       callback(null, geojson)
-
     }).catch(error => {
       log.error('Query entity', name, error)
       callback(getError(error.message))
     })
-
   }).catch(error => {
     log.error('Query get entity by layer id', error)
     // ArcGIS Server REST API has code 500, message null for invalid layer
@@ -105,7 +90,6 @@ function handleRelatedRecords (layer, query, graph, callback) {
 function handleLayerInfoRequest (layer, query, graph, callback) {
   graph.getEntityById(layer, query).then(geojson => {
     callback(null, geojson)
-
   }).catch(error => {
     log.error('layer info error for ' + layer, error)
     callback(error)
@@ -115,7 +99,6 @@ function handleLayerInfoRequest (layer, query, graph, callback) {
 function handleServerInfoRequest (query, graph, callback) {
   // this is a service metadata request
   graph.getDataModel(query).then((data) => {
-
     callback(null, data.FCs)
   }).catch(error => {
     log.error('error in server info', error)

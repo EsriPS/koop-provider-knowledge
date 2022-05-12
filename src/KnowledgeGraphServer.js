@@ -4,6 +4,11 @@ const { Parser } = require('node-sql-parser/build/postgresql')
 const config = require('config')
 const Logger = require('@koopjs/logger')
 const log = new Logger(config)
+const { toGeographic, positionToGeographic } = require('@terraformer/spatial')
+const { arcgisToGeoJSON } = require('@terraformer/arcgis')
+const { geojsonToWKT } = require('@terraformer/wkt')
+const _ = require('lodash')
+const fromExponential = require('from-exponential')
 
 /**
  * Transform a value with an array of coords from quantized to unquantized format
@@ -60,7 +65,6 @@ function convertGraphToRelationshipGeoJSON (rows, geometryField, transformObj) {
     const rowOId = Number(featureRow.entityValue.properties.objectid.primitiveValue.sint64Value)
 
     if (currentRel.properties.objectid !== rowOId) {
-
       if (currentRel.properties.objectid >= -1) {
         features.push(currentRel)
       }
@@ -98,7 +102,7 @@ function convertGraphToGeoJSON (rows, geometryField, transformObj) {
 
 function formatFeature (entity, geometryField, transformObj) {
   const shape = geometryField ? (entity.properties[geometryField]?.toJSON())?.primitiveValue.geometryValue : null
-  
+
   const featureProps = {}
   for (let key in entity.properties) {
     // need to handle more cases
@@ -221,12 +225,11 @@ function convertDataModelToFCs (dataModel) {
   tables.forEach((table, idx) => {
     table.metadata.id = layers.length + idx
   })
-  
-  dataModel.relationshipTypes.forEach(relationship => {
-    relationship.originEntityTypes.forEach( (originEntityType) => {
-      relationship.destEntityTypes.forEach( (destEntityType) => {
 
-        relJSON = buildRelationshipsJSON(
+  dataModel.relationshipTypes.forEach(relationship => {
+    relationship.originEntityTypes.forEach((originEntityType) => {
+      relationship.destEntityTypes.forEach((destEntityType) => {
+        const relJSON = buildRelationshipsJSON(
           relationships.length,
           relationship.relationship.name,
           layerTableMap[originEntityType].metadata.id,
@@ -237,10 +240,8 @@ function convertDataModelToFCs (dataModel) {
 
         if (originEntityType !== destEntityType) {
           layerTableMap[destEntityType].metadata.relationships.push(relJSON[1])
-          //relationships.push(relJSON[1])
+          // relationships.push(relJSON[1])
         }
-
-        
       })
     })
   })
@@ -249,8 +250,8 @@ function convertDataModelToFCs (dataModel) {
 
 function buildRelationshipsJSON (id, name, originId, destId) {
   return [
-    buildRelationshipJSON(id, name, destId, "esriRelCardinalityOneToMany", "esriRelRoleOrigin", "originGlobalID", false),
-    buildRelationshipJSON(id, name, originId, "esriRelCardinalityOneToMany", "esriRelRoleDestination", "destinationGlobalID", false)
+    buildRelationshipJSON(id, name, destId, 'esriRelCardinalityOneToMany', 'esriRelRoleOrigin', 'originGlobalID', false),
+    buildRelationshipJSON(id, name, originId, 'esriRelCardinalityOneToMany', 'esriRelRoleDestination', 'destinationGlobalID', false)
   ]
 }
 
@@ -336,7 +337,7 @@ class KnowledgeGraphServer {
               this.tables = layersAndTables.tables
               this.relationships = layersAndTables.relationships
 
-              resolve({dataModel:data, FCs:layersAndTables})
+              resolve({ dataModel: data, FCs: layersAndTables })
             } else {
               log.error('Error in retrieval of Data Model from AKG endpoint', data)
               this.dataModel = null
@@ -356,7 +357,6 @@ class KnowledgeGraphServer {
         let layerId = -1
         try {
           layerId = Number.parseInt(layerIdStr)
-
         } catch (e) {
           log.error("couldn't parse layerId", e)
           reject(new Error("couldn't parse layerId"))
@@ -367,7 +367,6 @@ class KnowledgeGraphServer {
 
           if (entity) resolve(entity)
           else reject(new Error('invalid layerId'))
-
         } else {
           reject(new Error('invalid layerId'))
         }
@@ -379,10 +378,13 @@ class KnowledgeGraphServer {
     return callback
   }
 
-  queryEntity (entity, query = {}) {
+  async queryEntity (entity, query = {}) {
     let namespace = 'n'
     let openCypherQuery = 'match (' + namespace + ':' + entity.metadata.name + ') '
-    if (query && ((query.where && query.where !== '1=1') || query.objectIds)) {
+
+    let { where, objectIds } = query
+
+    if (query && ((where && where !== '1=1') || objectIds)) {
       // https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer-.htm
       // todo add support for:
       // * geometry/geometryType?
@@ -393,24 +395,114 @@ class KnowledgeGraphServer {
       // * havingClause?
       // * returnDistinctValues?
       // * returnCountOnly
-      let where = query.where
-
-      if (query.objectIds) {
-        where = `objectid in (${query.objectIds})`
+      
+      if (objectIds) {
+        where = `objectid in (${objectIds})`
       }
 
       // will this always be the case that the entityType has objectid lowercase and koop wants it upper?
       where = where.replace(/OBJECTID/ig, 'objectid')
 
       const parser = new Parser()
-      const ast = parser.astify('SELECT * FROM BLAH as n WHERE ' + where)
+      const ast = parser.astify(`SELECT * FROM BLAH as n WHERE ${where}`)
       addNamespaceToAST(namespace, ast)
       where = sqlToOpenCypherWhere(parser.sqlify(ast))
-      openCypherQuery += 'where ' + where + ' '
+      openCypherQuery += `where ${where} `
+    }
+
+    const { returnIdsOnly, resultRecordCount, geometry, geometryType, spatialRel = 'esriSpatialRelIntersects' } = query
+
+    if (geometry) {
+      let method = 'ST_Intersects'
+      switch (spatialRel) {
+        case 'esriSpatialRelIntersects':
+          method = 'ST_Intersects'
+          break;
+        case 'esriSpatialRelContains':
+          method = 'ST_Contains'
+          break;
+      }
+
+      try {
+      //TODO ideally this projection will occur with @arcgis/core/geometry/projection however the whole
+      // project might need to be converted to an ES Module to allow use
+      // const wgsGeom = projection.project(geometry, {wkid:4326})
+      // Check if point or extent array format
+      if (_.isString(geometry)) {
+        const coords = geometry.split(',')
+        if (coords.length === 2) {
+          geometry = {
+            'x': coords[0],
+            'y': coords[1],
+            'spatialReference': _.isObject(inSR) ? inSR : { 'wkid': query.inSR || 4326 }
+          }
+        } else if (coords.length === 4) {
+          geometry = {
+            'xmin': coords[0],
+            'ymin': coords[1],
+            'xmax': coords[2],
+            'ymax': coords[3],
+            'spatialReference': _.isObject(inSR) ? inSR : { 'wkid': query.inSR || 4326 }
+          }
+        }
+      }
+
+      let geometries = [geometry]
+      // TODO what if the geometry is a polygon or line that's too wide?
+      // Determine if the Envelope is >180 deg, if so the knwowledge graph will error
+      if (_.has(geometry, 'xmin') && _.has(geometry, 'xmax')) {
+        if (geometry?.spatialReference?.wkid === 102100) {
+          const convMin = positionToGeographic([geometry.xmin, geometry.ymin])
+          // decimal degree precision doesn't need to be more than 6 places and was getting
+          // features with exponential precision if rounding doesn't occur
+          geometry.xmin = Math.round(convMin[0]*1000000.0)/1000000.0
+          geometry.ymin = Math.round(convMin[1]*1000000.0)/1000000.0
+          const convMax = positionToGeographic([geometry.xmax, geometry.ymax])
+          geometry.xmax = Math.round(convMax[0]*1000000.0)/1000000.0
+          geometry.ymax = Math.round(convMax[1]*1000000.0)/1000000.0
+          geometry.spatialReference.wkid = 4386
+        }
+        const delta = Math.abs(geometry.xmax - geometry.xmin)
+        console.log("delta", delta)
+        if (delta >= 180) {
+          console.log("***LARGE POLYGON", geometry)
+          let parts = delta >= 360 ? 4 : 2
+          for (let i = 1; i<parts; i++) {
+            let geom = geometries[i-1]
+            let extent = _.clone(geom)
+            geom.xmax = geom.xmin + delta/parts
+            extent.xmin = geom.xmax
+            geometries.push(extent)
+          }
+        }
+      }
+      console.log(geometries)
+      const field = entity.metadata.fields.find(field => field.type === 'Geometry')
+
+      const geoCypher = geometries.map( (geometry) => {
+        if (_.has(geometry, 'xmin') && _.has(geometry, 'xmax')) {
+          geometry.xmin = Math.round(geometry.xmin*1000000.0)/1000000.0
+          geometry.ymin = Math.round(geometry.ymin*1000000.0)/1000000.0
+          geometry.xmax = Math.round(geometry.xmax*1000000.0)/1000000.0
+          geometry.ymax = Math.round(geometry.ymax*1000000.0)/1000000.0
+        }
+        let geojsonGeom = arcgisToGeoJSON(geometry)
+        if (geometry?.spatialReference?.wkid === 102100) {
+          geojsonGeom = toGeographic(geojsonGeom)
+        }
+
+        const wktGeometry = geojsonToWKT( geojsonGeom )
+        return `esri.graph.${method}(esri.graph.ST_WKTToGeometry("${wktGeometry}"), ${namespace}.${field.name})`
+      })
+      openCypherQuery += openCypherQuery.indexOf('where ') > 0 ? 'and ' : 'where '
+      openCypherQuery += '(' + geoCypher.join(' OR ') + ') '
+    } catch (err) {
+      console.log(err)
+    }
     }
 
     // const outFields = query.outFields
-    if (query.returnIdsOnly && query.returnIdsOnly === 'true') {
+    if (returnIdsOnly && returnIdsOnly === 'true') {
       namespace = namespace + '.objectid'
     }
     // TODO figure out best way to filter fields, may require enhancing the parsing of responses
@@ -421,8 +513,8 @@ class KnowledgeGraphServer {
     // todo add query.returnCountOnly validation
     openCypherQuery += `return ${namespace}`// "return " + (query.returnCountOnly ? "count(" + namespace + ")" : namespace);
 
-    if (query.resultRecordCount) {
-      openCypherQuery += ' limit ' + query.resultRecordCount
+    if (resultRecordCount) {
+      openCypherQuery += ` limit ${resultRecordCount}`
     }
 
     log.debug('openCypyerQuery', openCypherQuery)
@@ -430,12 +522,12 @@ class KnowledgeGraphServer {
     return this.query(entity, openCypherQuery, query)
   }
 
-  query (entity, openCypherQuery, query, isRelationship=false) {
+  query (entity, openCypherQuery, query, isRelationship = false) {
     const callback = new Promise((resolve, reject) => {
       let callURL = this.url + '/graph/query/?openCypherQuery=' + encodeURIComponent(openCypherQuery)
-      if (query.geometry) {
-        callURL += '&geometry=' + encodeURIComponent(JSON.stringify(query.geometry)) + `&geometryType=${query.geometryType}&inSR=${query.inSR}`
-      }
+      // if (query.geometry) {
+      //   callURL += '&geometry=' + encodeURIComponent(JSON.stringify(query.geometry)) + `&geometryType=${query.geometryType}&inSR=${query.inSR}`
+      // }
 
       log.debug('Calling (url (no token version)' + callURL)
 
@@ -450,13 +542,12 @@ class KnowledgeGraphServer {
               geojson = {
                 type: 'FeatureCollection',
                 features: [],
-                count: getGraphCount(data.results.rows)
+                count: data.results.rows.length
               }
             } else {
               const field = entity.metadata.fields.find(field => field.type === 'Geometry')
               if (isRelationship) geojson = convertGraphToRelationshipGeoJSON(data.results.rows, field?.name, data.header.transform)
               else geojson = convertGraphToGeoJSON(data.results.rows, field?.name, data.header.transform)
-
             }
             geojson.metadata = { idField: 'OBJECTID' }
 
@@ -485,22 +576,21 @@ class KnowledgeGraphServer {
   }
 
   queryRelatedRecords (entity, query) {
-    const {relationshipId} = query
+    const { relationshipId } = query
 
     const entityRel = entity.metadata.relationships.find(rel => rel.id === relationshipId)
 
     const callback = new Promise((resolve, reject) => {
       this.getEntityById(entityRel.relatedTableId, query).then(newEntity => {
-
         let namespace = 'n'
-        let otherNamespace = 'm'
+        const otherNamespace = 'm'
         let originDirection = '>'
         let destDirection = ''
         if (entityRel.role === 'esriRelRoleDestination') {
           originDirection = ''
           destDirection = '<'
         }
-        //todo figure out direction arrow
+
         let openCypherQuery = `match (${namespace}:${entity.metadata.name})${destDirection}-[r:${entityRel.name}]-${originDirection}(${otherNamespace}:${newEntity.metadata.name})`
 
         if (query && ((query.where && query.where !== '1=1') || query.objectIds)) {
@@ -543,16 +633,15 @@ class KnowledgeGraphServer {
         openCypherQuery += `return ${namespace},${otherNamespace} order by ${namespace}.objectid`// "return " + (query.returnCountOnly ? "count(" + namespace + ")" : namespace);
 
         if (query.resultRecordCount) {
-          openCypherQuery += ' limit ' + query.resultRecordCount
+          openCypherQuery += ` limit ${query.resultRecordCount}`
         }
 
         log.debug('openCypyerQuery', openCypherQuery)
-    
+
         this.query(newEntity, openCypherQuery, query, true).then(data => {
           if (!data.metadata) data.metadata = {}
-          data.metadata.fields = newEntity.metadata.fields;
-          resolve(data);
-
+          data.metadata.fields = newEntity.metadata.fields
+          resolve(data)
         }).catch(error => reject(error))
       })
     })

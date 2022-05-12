@@ -334,7 +334,7 @@ const pbfUtils = {
             esriPBuffer.graph.GraphQueryResultHeader.decodeDelimited(reader)
           responseObj.header = header
         } catch (ex) {
-          //'Exception decoding response header
+          // 'Exception decoding response header
           // responseObj.error = ex;
           // readFrames = false;
           // Need to reset the reader to get errors returned from the server in the frames
@@ -376,7 +376,7 @@ const pbfUtils = {
       knowledgeGraphFetch(url, 'GET', null, headers)
         .then(response => {
           const contentType = response.headers.get('Content-Type')
-          
+
           if (contentType.startsWith('application/json')) {
             response.json().then(json => {
               reject(json.error)
